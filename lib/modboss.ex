@@ -13,31 +13,93 @@ defmodule ModBoss do
                         {:ok, any()} | {:error, any()})
   @type write_func :: (register_type(), starting_address :: integer(), value_or_values :: any() ->
                          :ok | {:error, any()})
+  @type builder_func :: (... -> read_func() | write_func())
   @type values_to_write :: [{atom(), any()}] | %{atom() => any()}
 
-  @doc false
-  def read_all(module, read_func, opts \\ []) do
-    readable_mappings =
-      module.__modbus_schema__()
-      |> Enum.filter(fn {_, mapping} -> Mapping.readable?(mapping) end)
-      |> Enum.map(fn {name, _mapping} -> name end)
+  @doc """
+  Convenience macro to configure the most common use case of ModBoss. Generally, it's expected that
+  one module will use one schema, and utilize one API for the actual reads and writes. However,
+  there's no set convention for Modbus APIs. Thus, ModBoss relies on being provided a function that
+  knows how to use the underlying API appropriately.
 
-    read(module, read_func, readable_mappings, opts)
+  ModBoss defines a type for two functions: `t:read_func/0` and `t:write_func/0`. These functions
+  are called internally by ModBoss, and take as arguments as much data from a spec that ModBoss
+  can gather. However, that data does not capture the full scope of what's needed to conduct a
+  Modbus transaction. Therefore, the user must provide their own implementation of these functions,
+  inserting whatever extra information is necessary for their purposes.
+
+  Rather than passing in an anonymous function to ModBoss every single time a read or write is
+  desired, `use ModBoss` allows the programmer to specify two keyword opts: `read_builder` and
+  `write_builder`. The values for these opts must be a public function, taking any number of args,
+  that returns a `t:read_func/0` or `t:write_func/0`.
+
+  ## Examples
+
+      defmodule Foo do
+        use GenServer
+        use ModBoss, read_builder: &__MODULE__.build_read/1, write_builder: &__MODULE__.build_write/1
+
+        @doc false
+        def build_read(pid) do
+          fn register_type, start_register, num_registers ->
+            UnderlyingModbusLibrary.read(pid, register_type, start_register, num_registers)
+          end
+        end
+
+        @doc false
+        def build_write(pid) do
+          fn register_type, start_register, values ->
+            UnderlyingModbusLibrary.write(pid, register_type, start_register, values)
+          end
+        end
+
+        # ...
+
+        def handle_call({:write_count_and_timestamp, count}, _from, state) do
+          now = DateTime.utc_now() |> DateTime.to_unix()
+          result = ModBoss.write(Foo.Schema, [count: count, timestamp: now], [state.modbus_pid])
+
+          {:reply, result, state}
+        end
+
+        def handle_call(:read_latest_write, _from, state) do
+          result = ModBoss.read(Foo.Schema, :timestamp, [state.modbus_pid])
+
+          {:reply, result, state}
+        end
+      end
+
+  Because the user might need any amount of data for their builder function, the args are provided
+  in a list to `ModBoss.read/4` and `ModBoss.write/3`. They will be applied as the A of MFA, where
+  the MF is the provided builder function.
+  """
+  @spec __using__(opts :: keyword()) :: Macro.t()
+  defmacro __using__(opts \\ []) do
+    read_builder = Keyword.fetch!(opts, :read_builder)
+    write_builder = Keyword.fetch!(opts, :write_builder)
+
+    quote do
+      require ModBoss
+
+      @modboss_read_builder unquote(read_builder)
+      @modboss_write_builder unquote(write_builder)
+    end
   end
 
   @doc """
-  Read from modbus using named mappings.
+  Read from Modbus using named mappings.
 
   This function takes either an atom or a list of atoms representing the mappings to read,
   batches the mappings into contiguous addresses per type, then reads and decodes the values
   before returning them.
 
-  For each batch, `read_func` will be called with the type of register (`:holding_register`,
-  `:input_register`, `:coil`, or `:discrete_input`), the starting address for the batch
-  to be read, and the count of addresses to read from. It must return either `{:ok, result}`
-  or `{:error, message}`.
+  For each batch, `builder_args` will be applied to the specified `t:builder_func/0` to get a
+  `t:read_func/0`. That function is then called with the type of register (`:holding_register`,
+  `:input_register`, `:coil`, or `:discrete_input`), the starting address for the batch to be read,
+  and the count of addresses to read from. It must return either `{:ok, result}` or
+  `{:error, message}`.
 
-  If a single name is requested, the result will be an :ok tuple including the singule result
+  If a single name is requested, the result will be an :ok tuple including the single result
   for that named mapping. If a list of names is requested, the result will be an :ok tuple
   including a map with mapping names as keys and mapping values as results.
 
@@ -45,31 +107,160 @@ defmodule ModBoss do
     * `:decode` — if `false`, returns the "raw" result as provided by `read_func`; defaults to `true`
 
   ## Examples
+      def read_builder(data) do
+        fn register_type, starting_address, count ->
+          result = custom_read_logic(register_type, starting_address, count, data)
 
-      read_func = fn register_type, starting_address, count ->
-        result = custom_read_logic(…)
-        {:ok, result}
+          result
+        end
       end
 
+      defp custom_read_logic(...) do
+        case UnderlyingModbus.read(...) do
+          {:ok, values} -> {:ok, values}
+          :error -> {:error, :read_failed}
+          error -> error
+        end
+      end
+
+      use ModBoss, read_builder: &__MODULE__.read_builder/1
+
       # Read one mapping
-      ModBoss.read(SchemaModule, read_func, :foo)
+      ModBoss.read(SchemaModule, :foo, [data])
       {:ok, 75}
 
       # Read multiple mappings
-      ModBoss.read(SchemaModule, read_func, [:foo, :bar, :baz])
+      ModBoss.read(SchemaModule, [:foo, :bar, :baz], [data])
       {:ok, %{foo: 75, bar: "ABC", baz: true}}
 
       # Read *all* readable mappings
-      ModBoss.read(SchemaModule, read_func, :all)
+      ModBoss.read(SchemaModule, :all, [data])
       {:ok, %{foo: 75, bar: "ABC", baz: true, qux: 1024}}
 
       # Get "raw" Modbus values (as returned by `read_func`)
-      ModBoss.read(SchemaModule, read_func, :all, decode: false)
+      ModBoss.read(SchemaModule, :all, [data], decode: false)
       {:ok, %{foo: 75, bar: [16706, 17152], baz: 1, qux: 1024}}
   """
-  @spec read(module(), read_func(), atom() | [atom()], keyword()) ::
+
+  @spec read(module(), atom() | [atom()], list(), keyword()) :: Macro.t()
+  defmacro read(schema, name_or_names, builder_args, opts \\ []) do
+    quote do
+      callback_fn = apply(@modboss_read_builder, unquote(builder_args))
+
+      unquote(__MODULE__).read_with(
+        unquote(schema),
+        callback_fn,
+        unquote(name_or_names),
+        unquote(opts)
+      )
+    end
+  end
+
+  @doc """
+  Write to Modbus using named mappings.
+
+  ModBoss automatically encodes your `values`, then batches any encoded values destined for
+  contiguous registers—creating separate batches per register type.
+
+  For each batch, `write_func` will be called with the type of register (`:holding_register` or
+  `:coil`), the starting address for the batch to be written, and a list of values to write.
+  It must return either `:ok` or `{:error, message}`.
+
+  For each batch, `builder_args` will be applied to the specified `t:builder_func/0` to get a
+  `t:write_func/0`. That function is then called with the type of register (`:holding_register`,
+  `:input_register`, `:coil`, or `:discrete_input`), the starting address for the batch to write,
+  and the values to write. It must return either `{:ok, result}` or
+  `{:error, message}`.
+
+  > #### Batch values {: .info}
+  >
+  > Each batch will contain **either a list or an individual value** based on the number of
+  > addresses to be written, so you should be prepared for both.
+
+  > #### Non-atomic writes! {: .warning}
+  >
+  > While `ModBoss.write/3` has the _feel_ of being atomic, it's important to recognize that it
+  > is not! It's fully possible that a write might fail after prior writes within the same call to
+  > `ModBoss.write/3` have already succeeded.
+  >
+  > Within `ModBoss.write/3`, if any call to `write_func` returns an error tuple,
+  > the function will immediately abort, and any subsequent writes will be skipped.
+
+  ## Example
+
+      def write_builder(data) do
+        fn register_type, starting_address, values ->
+          result = custom_write_logic(register_type, starting_address, values, data)
+
+          result
+        end
+      end
+
+      defp custom_write_logic(...) do
+        case UnderlyingModbus.write(...) do
+          {:ok, values} -> {:ok, values}
+          :error -> {:error, :read_failed}
+          error -> error
+        end
+      end
+
+      use ModBoss, write_builder: &__MODULE__.write_builder/1
+
+      iex> ModBoss.write(MyDevice.Schema, foo: 75, bar: "ABC", [data])
+      :ok
+  """
+
+  @spec write(module(), [{atom(), any()}] | map(), list()) :: Macro.t()
+  defmacro write(schema, values_to_write, builder_args) do
+    quote do
+      callback_fn = apply(@modboss_write_builder, unquote(builder_args))
+
+      unquote(__MODULE__).write_with(unquote(schema), callback_fn, unquote(values_to_write))
+    end
+  end
+
+  @doc false
+  defmacro read_all(module, read_args, opts \\ []) do
+    quote do
+      readable_mappings =
+        unquote(module).__modbus_schema__()
+        |> Enum.filter(fn {_, mapping} -> Mapping.readable?(mapping) end)
+        |> Enum.map(fn {name, _mapping} -> name end)
+
+      unquote(__MODULE__).read(
+        unquote(module),
+        readable_mappings,
+        unquote(read_args),
+        unquote(opts)
+      )
+    end
+  end
+
+  @doc """
+  Variant of read/4 that allows the read_func to be specified instead of relying on the builder
+  function given to the `use` macro. Using this is generally discouraged inside of a module that
+  specifies `use ModBoss, read_builder: &__MODULE__.read_builder`.
+  """
+  @spec read_with(module(), read_func(), atom() | [atom()], keyword()) ::
           {:ok, any()} | {:error, any()}
-  def read(module, read_func, name_or_names, opts \\ []) do
+  def read_with(schema, read_func, name_or_names, opts \\ []) do
+    do_read(schema, read_func, name_or_names, opts)
+  end
+
+  @doc """
+  Variant of write/3 that allows the read_func to be specified instead of relying on the builder
+  function given to the `use` macro. Using this is generally discouraged inside of a module that
+  specifies `use ModBoss, write_builder: &__MODULE__.write_builder`.
+  """
+  @spec write_with(module(), write_func(), values_to_write()) :: :ok | {:error, any()}
+  def write_with(schema, write_func, values_to_write) do
+    do_write(schema, write_func, values_to_write)
+  end
+
+  @doc false
+  @spec do_read(module(), read_func(), atom() | [atom()], keyword()) ::
+          {:ok, any()} | {:error, any()}
+  defp do_read(module, read_func, name_or_names, opts) do
     readable_mappings =
       module.__modbus_schema__()
       |> Enum.filter(fn {_, mapping} -> Mapping.readable?(mapping) end)
@@ -102,42 +293,9 @@ defmodule ModBoss do
     end)
   end
 
-  @doc """
-  Write to modbus using named mappings.
-
-  ModBoss automatically encodes your `values`, then batches any encoded values destined for
-  contiguous registers—creating separate batches per register type.
-
-  For each batch, `write_func` will be called with the type of register (`:holding_register` or
-  `:coil`), the starting address for the batch to be written, and a list of values to write.
-  It must return either `:ok` or `{:error, message}`.
-
-  > #### Batch values {: .info}
-  >
-  > Each batch will contain **either a list or an individual value** based on the number of
-  > addresses to be written—so you should be prepared for both.
-
-  > #### Non-atomic writes! {: .warning}
-  >
-  > While `ModBoss.write/3` has the _feel_ of being atomic, it's important to recognize that it
-  > is not! It's fully possible that a write might fail after prior writes within the same call to
-  > `ModBoss.write/3` have already succeeded.
-  >
-  > Within `ModBoss.write/3`, if any call to `write_func` returns an error tuple,
-  > the function will immediately abort, and any subsequent writes will be skipped.
-
-  ## Example
-
-      write_func = fn register_type, starting_address, value_or_values ->
-        result = custom_write_logic(…)
-        {:ok, result}
-      end
-
-      iex> ModBoss.write(MyDevice.Schema, write_func, foo: 75, bar: "ABC")
-      :ok
-  """
-  @spec write(module(), write_func(), values_to_write()) :: :ok | {:error, any()}
-  def write(module, write_func, values) when is_atom(module) and is_function(write_func) do
+  @doc false
+  @spec do_write(module(), write_func(), values_to_write()) :: :ok | {:error, any()}
+  defp do_write(module, write_func, values) when is_atom(module) and is_function(write_func) do
     with {:ok, mappings} <- get_mappings(:writable, module, get_keys(values)),
          mappings <- put_values(mappings, values),
          {:ok, mappings} <- encode(mappings),
